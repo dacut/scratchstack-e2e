@@ -76,9 +76,15 @@ def eventually_client_error(code, probe, *, timeout=EVENTUAL_TIMEOUT):
                 "Expected ClientError with code %s, but got %s; will retry in %s seconds",
                 code,
                 actual_code,
+                interval,
             )
         else:
             if time.monotonic() >= deadline:
                 raise AssertionError(f"Expected {code}, but the call succeeded")
+            log.info(
+                "Call succeeded, but expected ClientError with code %s; will retry in %s seconds",
+                code,
+                interval,
+            )
         time.sleep(interval)
         interval = min(interval * EVENTUAL_BACKOFF_MULTIPLIER, EVENTUAL_MAX_BACKOFF)
