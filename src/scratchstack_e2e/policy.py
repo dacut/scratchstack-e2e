@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 from types_boto3_iam import IAMClient
 
 from .case import TEST_PATH, unique_name
-from .retry import eventually
+from .retry import eventually, eventually_or_error
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,15 @@ class Policy:
         self.policy_name = policy_name
         self.tags = tags
 
+    def forget(self):
+        """
+        Mark the policy as already gone, so teardown does not try to delete it.
+
+        For tests whose subject is the deletion itself; see `Role.forget` for
+        why the caller rather than the retry helper has to say so.
+        """
+        self.arn = None
+
     def delete(self):
         arn = self.arn
         if arn is None:
@@ -74,7 +83,10 @@ class Policy:
                             entity[name_field],
                         )
                         kwargs = {name_field: entity[name_field], "PolicyArn": arn}
-                        eventually(lambda: getattr(self.iam, method)(**kwargs))
+                        eventually_or_error(
+                            lambda: getattr(self.iam, method)(**kwargs),
+                            allowed=["NoSuchEntity"],
+                        )
         except self.iam.exceptions.NoSuchEntityException:
             pass
 
@@ -91,17 +103,21 @@ class Policy:
                                 vid,
                                 arn,
                             )
-                            eventually(
+                            eventually_or_error(
                                 lambda: self.iam.delete_policy_version(
                                     PolicyArn=arn, VersionId=vid
-                                )
+                                ),
+                                allowed=["NoSuchEntity"],
                             )
         except self.iam.exceptions.NoSuchEntityException:
             pass
 
         try:
             log.info("Deleting policy %s", arn)
-            eventually(lambda: self.iam.delete_policy(PolicyArn=arn))
+            eventually_or_error(
+                lambda: self.iam.delete_policy(PolicyArn=arn),
+                allowed=["NoSuchEntity"],
+            )
         except self.iam.exceptions.NoSuchEntityException:
             pass
 

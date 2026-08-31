@@ -38,16 +38,46 @@ def eventually(probe, *, timeout=EVENTUAL_TIMEOUT):
         try:
             return probe()
         except ClientError as e:
-            if time.monotonic() >= deadline:
-                raise
             error = e.response.get("Error")
             assert isinstance(error, dict)
             code = error.get("Code")
+            if time.monotonic() >= deadline:
+                raise
             log.info(
-                "Error %s encountered, will retry in %s seconds; probe=%s",
+                "Error %s encountered, will retry in %s seconds",
                 code,
                 interval,
-                probe,
+            )
+            time.sleep(interval)
+            interval = min(interval * EVENTUAL_BACKOFF_MULTIPLIER, EVENTUAL_MAX_BACKOFF)
+
+
+def eventually_or_error(probe, allowed, *, timeout=EVENTUAL_TIMEOUT):
+    """
+    Call `probe` until it returns or raises an allowed error, and
+    return its value.
+
+    This is typically used for deleting resources that might have already
+    been cleaned up. `allowed` should be set to ["NoSuchEntity"] in those
+    cases.
+    """
+    deadline = time.monotonic() + timeout
+    interval = EVENTUAL_INIT_BACKOFF
+    while True:
+        try:
+            return probe()
+        except ClientError as e:
+            error = e.response.get("Error")
+            assert isinstance(error, dict)
+            code = error.get("Code")
+            if code in allowed:
+                return
+            if time.monotonic() >= deadline:
+                raise
+            log.info(
+                "Error %s encountered, will retry in %s seconds",
+                code,
+                interval,
             )
             time.sleep(interval)
             interval = min(interval * EVENTUAL_BACKOFF_MULTIPLIER, EVENTUAL_MAX_BACKOFF)

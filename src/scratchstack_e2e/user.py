@@ -9,7 +9,7 @@ import boto3.session
 from types_boto3_iam import IAMClient
 
 from .case import TEST_PATH, unique_name
-from .retry import eventually
+from .retry import eventually, eventually_or_error
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +46,16 @@ class User:
     def __del__(self):
         self.delete()
 
+    def forget(self):
+        """
+        Mark the user as already gone, so teardown does not try to delete it.
+
+        For tests whose subject is the deletion itself; see `Role.forget` for
+        why the caller rather than the retry helper has to say so.
+        """
+        self.arn = None
+        self.user_id = None
+
     def delete(self) -> None:
         if self.arn is None and self.user_id is None:
             return
@@ -75,10 +85,11 @@ class User:
                         log.info(
                             "Deleting access key %s for user %s", akid, self.user_name
                         )
-                        eventually(
+                        eventually_or_error(
                             lambda: self.iam.delete_access_key(
                                 UserName=self.user_name, AccessKeyId=akid
-                            )
+                            ),
+                            allowed=["NoSuchEntity"],
                         )
         except self.iam.exceptions.NoSuchEntityException:
             pass
@@ -93,10 +104,11 @@ class User:
                             group_name  # Capture local iteration for the lambda/pyright
                         )
                         log.info("Removing user %s from group %s", self.user_name, gn)
-                        eventually(
+                        eventually_or_error(
                             lambda: self.iam.remove_user_from_group(
                                 GroupName=gn, UserName=self.user_name
-                            )
+                            ),
+                            allowed=["NoSuchEntity"],
                         )
         except self.iam.exceptions.NoSuchEntityException:
             pass
@@ -113,10 +125,11 @@ class User:
                         log.info(
                             "Detaching user policy %s from user %s", pa, self.user_name
                         )
-                        eventually(
+                        eventually_or_error(
                             lambda: self.iam.detach_user_policy(
                                 UserName=self.user_name, PolicyArn=pa
-                            )
+                            ),
+                            allowed=["NoSuchEntity"],
                         )
         except self.iam.exceptions.NoSuchEntityException:
             pass
@@ -132,17 +145,21 @@ class User:
                             pn,
                             self.user_name,
                         )
-                        eventually(
+                        eventually_or_error(
                             lambda: self.iam.delete_user_policy(
                                 UserName=self.user_name, PolicyName=pn
-                            )
+                            ),
+                            allowed=["NoSuchEntity"],
                         )
         except self.iam.exceptions.NoSuchEntityException:
             pass
 
         try:
             log.info("Deleting user %s", self.user_name)
-            eventually(lambda: self.iam.delete_user(UserName=self.user_name))
+            eventually_or_error(
+                lambda: self.iam.delete_user(UserName=self.user_name),
+                allowed=["NoSuchEntity"],
+            )
             self.arn = None
             self.user_id = None
             log.info("Deleted user %s", self.user_name)

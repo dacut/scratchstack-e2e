@@ -11,9 +11,14 @@ boundary backs iam:PermissionsBoundary.
     DeleteRolePolicy               tags + boundary
     DeleteUserPermissionsBoundary  tags + boundary
     DeleteUserPolicy               tags + boundary
+    DeleteUser                     tags only -- boundary asserted absent
+    DeletePolicy                   tags only
+    DeletePolicyVersion            tags only
     CreateAccessKey                tags only
     UpdateAccessKey                tags only
     DeleteAccessKey                tags only
+    DeleteGroup                    nothing at all
+    DeleteGroupPolicy              nothing at all
 
 The access key operations act on a user and read its tags, but IAM defines no
 iam:PermissionsBoundary for them, so only the two resource-tag spellings are
@@ -22,7 +27,18 @@ Deactivate* operation IAM has is DeactivateMFADevice, and deactivating a key is
 UpdateAccessKey with Status=Inactive, which is what test_update_access_key
 does.
 
-Every key an operation is said to supply is asserted for it. The stakes are not symmetric: a *missing*
+Every key an operation is said to supply is asserted for it, and where a key is
+said *not* to be supplied that is asserted too -- DeleteUser withholding
+iam:PermissionsBoundary, and the group operations supplying nothing. An absence
+is asserted from both sides: Null matches only a key that is missing and must
+be allowed, while StringEquals cannot match one and must be denied. Neither
+half suffices alone, since an allow cannot tell a present key from an ignored
+condition and a denial cannot tell an absent key from an unpropagated grant.
+
+The DeleteUser case turns on a detail worth stating: every target carries a
+permissions boundary. Against a user with none the key would be missing for
+want of a value rather than because the operation withholds it, and the test
+would pass without having looked at the question. The stakes are not symmetric: a *missing*
 key leaves a guard dormant that should have fired, while a *spurious* one makes
 a StringNotEquals deny guard fire where IAM leaves it dormant, changing the
 meaning of a policy an operator already wrote. Scratchstack supplies all three
@@ -59,20 +75,29 @@ denial asserted last cannot be a not-yet-live grant.
 """
 
 import time
+from collections import namedtuple
 from json import dumps
 from logging import getLogger
 
 from botocore.exceptions import ClientError
 
-from scratchstack_e2e import IamTestCase, Policy, Role, User
+from scratchstack_e2e import Group, IamTestCase, Policy, Role, User
 from scratchstack_e2e.arn import Arn
 from scratchstack_e2e.aspen import allow, policy, trust_policy
-from scratchstack_e2e.retry import (EVENTUAL_BACKOFF_MULTIPLIER,
-                                    EVENTUAL_INIT_BACKOFF,
-                                    EVENTUAL_MAX_BACKOFF, EVENTUAL_TIMEOUT,
-                                    eventually, eventually_client_error)
+from scratchstack_e2e.retry import (
+    EVENTUAL_BACKOFF_MULTIPLIER,
+    EVENTUAL_INIT_BACKOFF,
+    EVENTUAL_MAX_BACKOFF,
+    EVENTUAL_TIMEOUT,
+    eventually,
+    eventually_client_error,
+)
 
 log = getLogger(__name__)
+
+#: One condition key asserted about one operation: the statement `condition`
+#: that isolates it, and the `entity` reached only through that statement.
+Check = namedtuple("Check", "label condition entity")
 
 #: The tag the resource-tag conditions are written against.
 TAG_KEY = "TestTag1"
@@ -86,6 +111,9 @@ INLINE_POLICY_NAME = "scratchstack-test-inline"
 #: A valid document, for the inline policies and the boundary policies alike.
 #: None of these tests care what any of them says.
 SOME_DOCUMENT = policy(allow(action="s3:GetObject", resource="*"))
+
+#: A second document, for the extra policy version DeletePolicyVersion removes.
+SECOND_DOCUMENT = policy(allow(action="s3:PutObject", resource="*"))
 
 
 def eventually_not_denied(probe, *, timeout=EVENTUAL_TIMEOUT):
@@ -186,6 +214,41 @@ class TestExistingEntityConditions(IamTestCase):
             )
         return user
 
+    @staticmethod
+    def supplied(key, value, entity):
+        """
+        A check that `key` is supplied carrying `value`: the statement matches
+        only if it is, so the operation must be allowed on `entity`.
+        """
+        return Check(f"{key} supplied", {"StringEquals": {key: value}}, entity)
+
+    @staticmethod
+    def absent(key, entity):
+        """
+        A check that `key` is not supplied at all. Null matches only a key that
+        is missing, so the operation must be allowed on `entity`.
+
+        Pair this with `mismatched` on a second entity. On its own an allow
+        here says the key is absent, but only the denial rules out the
+        condition being ignored altogether.
+        """
+        return Check(f"{key} absent", {"Null": {key: "true"}}, entity)
+
+    @staticmethod
+    def mismatched(key, value, entity):
+        """
+        A statement naming `entity` under a value it does not carry -- or under
+        a key it does not have at all. Either way it cannot match, so the
+        operation must be denied.
+        """
+        return Check(f"{key} does not match", {"StringEquals": {key: value}}, entity)
+
+    def mismatched_tag(self, entity):
+        """
+        The usual denial: an entity named under a tag value it does not carry.
+        """
+        return self.mismatched(f"aws:ResourceTag/{TAG_KEY}", TAG_VALUE, entity)
+
     def tag_checks(self, entities):
         """
         The two resource-tag spellings, one entity apiece.
@@ -194,8 +257,8 @@ class TestExistingEntityConditions(IamTestCase):
         are told apart by which statement reaches which entity.
         """
         return [
-            (f"aws:ResourceTag/{TAG_KEY}", TAG_VALUE, entities[0]),
-            (f"iam:ResourceTag/{TAG_KEY}", TAG_VALUE, entities[1]),
+            self.supplied(f"aws:ResourceTag/{TAG_KEY}", TAG_VALUE, entities[0]),
+            self.supplied(f"iam:ResourceTag/{TAG_KEY}", TAG_VALUE, entities[1]),
         ]
 
     def tag_and_boundary_checks(self, entities, boundary_arn):
@@ -203,55 +266,100 @@ class TestExistingEntityConditions(IamTestCase):
         The two resource-tag spellings plus iam:PermissionsBoundary.
         """
         return self.tag_checks(entities) + [
-            ("iam:PermissionsBoundary", boundary_arn, entities[2]),
+            self.supplied("iam:PermissionsBoundary", boundary_arn, entities[2]),
         ]
 
-    def assert_keys_govern(self, action, checks, other, invoke):
+    def target_policy(self, tag_value, *, with_extra_version=False):
         """
-        Assert that `action` supplies each condition key in `checks`.
+        A managed policy carrying the given tag value, created and torn down as
+        the admin principal.
+        """
+        created = self.fixture(
+            Policy(self.iam, SOME_DOCUMENT, tags={TAG_KEY: tag_value})
+        )
+        if with_extra_version:
+            # A non-default version, so DeletePolicyVersion has something to
+            # remove that is not the default one it is forbidden to touch.
+            arn = created.arn
+            if arn is not None:
+                eventually(
+                    lambda: self.iam.create_policy_version(
+                        PolicyArn=arn,
+                        PolicyDocument=dumps(SECOND_DOCUMENT),
+                    )
+                )
+        return created
 
-        `checks` pairs each key and the value it should carry with the entity
-        the grant reaches through it, via a statement scoped to that entity's
-        ARN and conditioned on that key alone -- so exactly one statement can
-        account for each allow. `other` is an entity a statement names with a
-        tag value it does not carry; its denial is what shows the conditions
-        are evaluated rather than ignored. `invoke` performs the operation
-        against one entity as the subject.
+    def target_group(self, *, with_inline_policy=False):
         """
+        A group, created and torn down as the admin principal.
+
+        Groups take no tags -- IAM has no group-tagging operation -- so unlike
+        the other targets here they are told apart only by their ARNs.
+        """
+        group = self.fixture(Group(self.iam))
+        if with_inline_policy:
+            eventually(
+                lambda: self.iam.put_group_policy(
+                    GroupName=group.group_name,
+                    PolicyName=INLINE_POLICY_NAME,
+                    PolicyDocument=dumps(SOME_DOCUMENT),
+                )
+            )
+        return group
+
+    def assert_conditions(self, action, allowed, denied, invoke):
+        """
+        Assert what `action` supplies, one condition key at a time.
+
+        Every check contributes a statement scoped to its own entity ARN and
+        conditioned on that key alone, so exactly one statement can account for
+        each outcome. Checks in `allowed` must let the operation through;
+        checks in `denied` must not. `invoke` performs the operation against
+        one entity as the subject.
+
+        Both lists matter. An allow alone cannot tell a key that is present
+        from a condition that is being ignored, and a denial alone cannot tell
+        a key that is absent from a grant that has not propagated -- which is
+        why the allows run first, retried until the grant is live.
+        """
+        checks = list(allowed) + list(denied)
         grant = policy(
             *[
                 allow(
                     action=action,
-                    resource=entity.arn,
-                    condition={"StringEquals": {key: value}},
+                    resource=check.entity.arn,
+                    condition=check.condition,
                 )
-                for key, value, entity in checks
+                for check in checks
             ],
-            # Named, but with a tag value the entity does not carry. Its being
-            # denied is what shows the conditions are evaluated at all.
-            allow(
-                action=action,
-                resource=other.arn,
-                condition={"StringEquals": {f"aws:ResourceTag/{TAG_KEY}": TAG_VALUE}},
-            ),
             # Granted unconditionally as a propagation probe.
-            allow(action=["iam:ListRoles", "iam:ListUsers"], resource="*"),
+            allow(
+                action=[
+                    "iam:ListGroups",
+                    "iam:ListPolicies",
+                    "iam:ListRoles",
+                    "iam:ListUsers",
+                ],
+                resource="*",
+            ),
         )
 
         with User(self.iam, permissions=grant) as subject:
             iam = subject.client("iam")
             eventually(lambda: iam.list_users(MaxItems=1))
 
-            for key, _value, entity in checks:
-                with self.subTest(condition_key=key):
-                    log.info("Expecting %s to be allowed by %s", action, key)
-                    eventually_not_denied(lambda: invoke(iam, entity))
+            for check in allowed:
+                with self.subTest(check=check.label):
+                    log.info("Expecting %s to be allowed: %s", action, check.label)
+                    eventually_not_denied(lambda: invoke(iam, check.entity))
 
-            with self.subTest(condition_key="non-matching value"):
-                log.info("Expecting %s to be denied on the non-matching entity", action)
-                eventually_client_error(
-                    "AccessDenied", lambda: invoke(iam, other)
-                )
+            for check in denied:
+                with self.subTest(check=check.label):
+                    log.info("Expecting %s to be denied: %s", action, check.label)
+                    eventually_client_error(
+                        "AccessDenied", lambda: invoke(iam, check.entity)
+                    )
 
     def test_delete_role(self):
         """
@@ -273,10 +381,10 @@ class TestExistingEntityConditions(IamTestCase):
             # for the whole budget before giving up.
             role.forget()
 
-        self.assert_keys_govern(
+        self.assert_conditions(
             "iam:DeleteRole",
             self.tag_and_boundary_checks(named, boundary.arn),
-            other,
+            [self.mismatched_tag(other)],
             invoke,
         )
 
@@ -301,10 +409,10 @@ class TestExistingEntityConditions(IamTestCase):
                 RoleName=role.role_name, PolicyName=INLINE_POLICY_NAME
             )
 
-        self.assert_keys_govern(
+        self.assert_conditions(
             "iam:DeleteRolePolicy",
             self.tag_and_boundary_checks(named, boundary.arn),
-            other,
+            [self.mismatched_tag(other)],
             invoke,
         )
 
@@ -327,10 +435,10 @@ class TestExistingEntityConditions(IamTestCase):
             log.info("Attempting to delete boundary on user %s", user.user_name)
             iam.delete_user_permissions_boundary(UserName=user.user_name)
 
-        self.assert_keys_govern(
+        self.assert_conditions(
             "iam:DeleteUserPermissionsBoundary",
             self.tag_and_boundary_checks(named, boundary.arn),
-            other,
+            [self.mismatched_tag(other)],
             invoke,
         )
 
@@ -355,10 +463,10 @@ class TestExistingEntityConditions(IamTestCase):
                 UserName=user.user_name, PolicyName=INLINE_POLICY_NAME
             )
 
-        self.assert_keys_govern(
+        self.assert_conditions(
             "iam:DeleteUserPolicy",
             self.tag_and_boundary_checks(named, boundary.arn),
-            other,
+            [self.mismatched_tag(other)],
             invoke,
         )
 
@@ -392,8 +500,11 @@ class TestExistingEntityConditions(IamTestCase):
             log.info("Attempting to create an access key for user %s", user.user_name)
             iam.create_access_key(UserName=user.user_name)
 
-        self.assert_keys_govern(
-            "iam:CreateAccessKey", self.tag_checks(named), other, invoke
+        self.assert_conditions(
+            "iam:CreateAccessKey",
+            self.tag_checks(named),
+            [self.mismatched_tag(other)],
+            invoke,
         )
 
     def test_update_access_key(self):
@@ -407,15 +518,20 @@ class TestExistingEntityConditions(IamTestCase):
         named, other = self.access_key_targets()
 
         def invoke(iam, user):
-            log.info("Attempting to deactivate the access key of user %s", user.user_name)
+            log.info(
+                "Attempting to deactivate the access key of user %s", user.user_name
+            )
             iam.update_access_key(
                 UserName=user.user_name,
                 AccessKeyId=user.credentials["AccessKeyId"],
                 Status="Inactive",
             )
 
-        self.assert_keys_govern(
-            "iam:UpdateAccessKey", self.tag_checks(named), other, invoke
+        self.assert_conditions(
+            "iam:UpdateAccessKey",
+            self.tag_checks(named),
+            [self.mismatched_tag(other)],
+            invoke,
         )
 
     def test_delete_access_key(self):
@@ -436,6 +552,159 @@ class TestExistingEntityConditions(IamTestCase):
                 AccessKeyId=user.credentials["AccessKeyId"],
             )
 
-        self.assert_keys_govern(
-            "iam:DeleteAccessKey", self.tag_checks(named), other, invoke
+        self.assert_conditions(
+            "iam:DeleteAccessKey",
+            self.tag_checks(named),
+            [self.mismatched_tag(other)],
+            invoke,
+        )
+
+    # ------------------------------------------------------------------
+    # The remaining delete operations
+    # ------------------------------------------------------------------
+
+    def test_delete_user(self):
+        """
+        Test that DeleteUser supplies both resource-tag spellings and *not*
+        iam:PermissionsBoundary.
+
+        The documentation lists the boundary key for the operations that change
+        what an entity may do, but not for deleting one. That absence is
+        asserted here rather than assumed, because the same documentation has
+        already proved wrong twice for the policy APIs -- and in this direction
+        the error is the damaging one: a boundary key supplied where IAM
+        supplies none makes a StringNotEquals deny guard fire on a policy an
+        operator already wrote.
+
+        Every target carries a boundary, which is what makes the assertion mean
+        anything. Against a user with no boundary the key would be missing for
+        want of a value rather than because the operation withholds it, and the
+        test would pass without having looked at the question.
+        """
+        boundary = self.boundary_policy()
+        other_boundary = self.boundary_policy()
+        named = [self.target_user(TAG_VALUE, boundary.arn) for _ in range(3)]
+        pb_named = self.target_user(TAG_VALUE, boundary.arn)
+        other = self.target_user(OTHER_TAG_VALUE, other_boundary.arn)
+
+        def invoke(iam, user):
+            log.info("Attempting to delete user %s", user.user_name)
+            iam.delete_user(UserName=user.user_name)
+            # Ownership handoff, as for DeleteRole: the fixture cleans up right
+            # until the delete succeeds, and not after.
+            user.forget()
+
+        self.assert_conditions(
+            "iam:DeleteUser",
+            self.tag_checks(named) + [self.absent("iam:PermissionsBoundary", named[2])],
+            [
+                # The boundary is set on this user, so a supplied key would
+                # match and let the call through. It must not.
+                self.mismatched("iam:PermissionsBoundary", boundary.arn, pb_named),
+                self.mismatched_tag(other),
+            ],
+            invoke,
+        )
+
+    def test_delete_policy(self):
+        """
+        Test that DeletePolicy supplies both resource-tag spellings from the
+        policy being deleted.
+        """
+        named = [self.target_policy(TAG_VALUE) for _ in range(2)]
+        other = self.target_policy(OTHER_TAG_VALUE)
+
+        def invoke(iam, managed_policy):
+            log.info("Attempting to delete policy %s", managed_policy.arn)
+            iam.delete_policy(PolicyArn=managed_policy.arn)
+            managed_policy.forget()
+
+        self.assert_conditions(
+            "iam:DeletePolicy",
+            self.tag_checks(named),
+            [self.mismatched_tag(other)],
+            invoke,
+        )
+
+    def test_delete_policy_version(self):
+        """
+        Test that DeletePolicyVersion supplies both resource-tag spellings.
+
+        The keys describe the policy, not the version being removed. The policy
+        survives, so no ownership handoff is needed; the fixture finds one
+        version left and deletes the policy as usual.
+        """
+        named = [
+            self.target_policy(TAG_VALUE, with_extra_version=True) for _ in range(2)
+        ]
+        other = self.target_policy(OTHER_TAG_VALUE, with_extra_version=True)
+
+        def invoke(iam, managed_policy):
+            log.info("Attempting to delete a version of policy %s", managed_policy.arn)
+            iam.delete_policy_version(PolicyArn=managed_policy.arn, VersionId="v2")
+
+        self.assert_conditions(
+            "iam:DeletePolicyVersion",
+            self.tag_checks(named),
+            [self.mismatched_tag(other)],
+            invoke,
+        )
+
+    def test_delete_group(self):
+        """
+        Test that DeleteGroup supplies no request context at all.
+
+        Groups are not taggable and are not principals, so there is nothing for
+        a condition key to describe. As with CreateGroup, that is asserted from
+        both sides rather than assumed: Null matches only a key that is absent
+        and must be allowed, StringEquals cannot match one and must be denied,
+        and an unconditioned statement proves the grant is live before either
+        is read as evidence.
+        """
+        unconditioned = self.target_group()
+        null_checked = self.target_group()
+        other = self.target_group()
+        tag_key = f"aws:ResourceTag/{TAG_KEY}"
+
+        def invoke(iam, group):
+            log.info("Attempting to delete group %s", group.group_name)
+            iam.delete_group(GroupName=group.group_name)
+            group.forget()
+
+        self.assert_conditions(
+            "iam:DeleteGroup",
+            [
+                Check("no condition at all", None, unconditioned),
+                self.absent(tag_key, null_checked),
+            ],
+            [self.mismatched(tag_key, TAG_VALUE, other)],
+            invoke,
+        )
+
+    def test_delete_group_policy(self):
+        """
+        Test that DeleteGroupPolicy supplies no request context either.
+
+        The inline policy goes away but the group does not, so no ownership
+        handoff is needed.
+        """
+        unconditioned = self.target_group(with_inline_policy=True)
+        null_checked = self.target_group(with_inline_policy=True)
+        other = self.target_group(with_inline_policy=True)
+        tag_key = f"aws:ResourceTag/{TAG_KEY}"
+
+        def invoke(iam, group):
+            log.info("Attempting to delete inline policy on group %s", group.group_name)
+            iam.delete_group_policy(
+                GroupName=group.group_name, PolicyName=INLINE_POLICY_NAME
+            )
+
+        self.assert_conditions(
+            "iam:DeleteGroupPolicy",
+            [
+                Check("no condition at all", None, unconditioned),
+                self.absent(tag_key, null_checked),
+            ],
+            [self.mismatched(tag_key, TAG_VALUE, other)],
+            invoke,
         )

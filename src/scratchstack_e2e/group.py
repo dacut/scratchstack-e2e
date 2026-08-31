@@ -5,7 +5,7 @@ import secrets
 
 from types_boto3_iam import IAMClient
 
-from .retry import eventually
+from .retry import eventually, eventually_or_error
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +41,20 @@ class Group:
     def __del__(self):
         self.delete()
 
+    def forget(self):
+        """
+        Mark the group as already gone, so teardown does not try to delete it.
+
+        For tests whose subject is the deletion itself; see `Role.forget` for
+        why the caller rather than the retry helper has to say so.
+        """
+        self.arn = None
+        self.group_id = None
+
     def delete(self):
+        if self.arn is None and self.group_id is None:
+            return
+
         try:
             paginator = self.iam.get_paginator("get_group")
             for page in eventually(
@@ -53,10 +66,11 @@ class Group:
                         user["UserName"],
                         self.group_name,
                     )
-                    eventually(
+                    eventually_or_error(
                         lambda: self.iam.remove_user_from_group(
                             GroupName=self.group_name, UserName=user["UserName"]
-                        )
+                        ),
+                        allowed=["NoSuchEntity"],
                     )
         except self.iam.exceptions.NoSuchEntityException:
             pass
@@ -77,10 +91,11 @@ class Group:
                             parn,
                             self.group_name,
                         )
-                        eventually(
+                        eventually_or_error(
                             lambda: self.iam.detach_group_policy(
                                 GroupName=self.group_name, PolicyArn=parn
-                            )
+                            ),
+                            allowed=["NoSuchEntity"],
                         )
         except self.iam.exceptions.NoSuchEntityException:
             pass
@@ -96,17 +111,21 @@ class Group:
                         policy_name,
                         self.group_name,
                     )
-                    eventually(
+                    eventually_or_error(
                         lambda: self.iam.delete_group_policy(
                             GroupName=self.group_name, PolicyName=policy_name
-                        )
+                        ),
+                        allowed=["NoSuchEntity"],
                     )
         except self.iam.exceptions.NoSuchEntityException:
             pass
 
         try:
             log.info("Deleting group %s", self.group_name)
-            eventually(lambda: self.iam.delete_group(GroupName=self.group_name))
+            eventually_or_error(
+                lambda: self.iam.delete_group(GroupName=self.group_name),
+                allowed=["NoSuchEntity"],
+            )
         except self.iam.exceptions.NoSuchEntityException:
             pass
 

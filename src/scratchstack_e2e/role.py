@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 from types_boto3_iam import IAMClient
 
 from .case import TEST_PATH, unique_name
-from .retry import eventually
+from .retry import eventually, eventually_or_error
 
 log = logging.getLogger(__name__)
 
@@ -97,17 +97,21 @@ class Role:
                         policy_name,
                         self.role_name,
                     )
-                    eventually(
+                    eventually_or_error(
                         lambda: self.iam.delete_role_policy(
                             RoleName=self.role_name, PolicyName=policy_name
-                        )
+                        ),
+                        allowed=["NoSuchEntity"],
                     )
         except self.iam.exceptions.NoSuchEntityException:
             pass
 
         try:
             log.info("Deleting role %s", self.role_name)
-            eventually(lambda: self.iam.delete_role(RoleName=self.role_name))
+            eventually_or_error(
+                lambda: self.iam.delete_role(RoleName=self.role_name),
+                allowed=["NoSuchEntity"],
+            )
             log.info("Deleted role %s", self.role_name)
             self.arn = None
             self.role_id = None
