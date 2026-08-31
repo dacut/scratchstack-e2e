@@ -3,12 +3,11 @@ Tests for user authorization behavior.
 """
 
 from logging import getLogger
-from time import sleep
 
 from scratchstack_e2e import TEST_PATH, IamTestCase, Policy, User, unique_name
+from scratchstack_e2e.arn import Arn
 from scratchstack_e2e.aspen import allow, deny, policy
 from scratchstack_e2e.retry import eventually, eventually_client_error
-from scratchstack_e2e.arn import Arn
 
 log = getLogger(__name__)
 
@@ -29,6 +28,7 @@ class TestUserAuthorization(IamTestCase):
         partition = arn.partition
         account_id = arn.account_id
         user_name = unique_name()
+        denied_name = unique_name()
 
         with Policy(self.iam, boundary_permissions) as boundary:
             user_permission = policy(
@@ -43,20 +43,23 @@ class TestUserAuthorization(IamTestCase):
                     action="iam:DeleteUser",
                     resource=f"arn:{partition}:iam::{account_id}:user{TEST_PATH}{user_name}",
                 ),
+                # Granted unconditionally as a propagation probe; see below.
+                allow(action="iam:ListUsers", resource="*"),
             )
             with User(self.iam, permissions=user_permission) as user:
                 iam = user.client("iam")
 
-                def missing_pb():
-                    log.info(
-                        "Attempting to create user %s without permissions boundary",
-                        user_name,
-                    )
-                    iam.create_user(UserName=user_name, Path=TEST_PATH)
-                    log.info("Created user %s", user_name)
+                # A newly attached inline policy takes time to propagate, and
+                # until it does every call is denied for want of any policy at
+                # all. iam:ListUsers is granted unconditionally in the same
+                # document, so its succeeding rules out that state.
+                eventually(lambda: iam.list_users(MaxItems=1))
 
-                eventually_client_error("AccessDenied", missing_pb)
-
+                # The allowed case runs first, and is retried until the grant
+                # is in effect. Only then does a denial mean the condition
+                # failed rather than the grant not having arrived: the probe
+                # above shows the document is live, but not that this
+                # statement's condition is being applied yet.
                 def with_pb():
                     log.info(
                         "Attempting to create user %s with permissions boundary",
@@ -75,6 +78,18 @@ class TestUserAuthorization(IamTestCase):
                 log.info("Deleting user %s", user_name)
                 eventually(lambda: iam.delete_user(UserName=user_name))
                 log.info("Deleted user %s", user_name)
+
+                # A distinct name, so that the deletion above needing to
+                # propagate cannot turn this into EntityAlreadyExists.
+                def missing_pb():
+                    log.info(
+                        "Attempting to create user %s without permissions boundary",
+                        denied_name,
+                    )
+                    iam.create_user(UserName=denied_name, Path=TEST_PATH)
+                    log.info("Created user %s", denied_name)
+
+                eventually_client_error("AccessDenied", missing_pb)
 
     def test_tags(self):
         """
@@ -106,20 +121,25 @@ class TestUserAuthorization(IamTestCase):
                     },
                 },
             ),
+            # Granted unconditionally as a propagation probe; see below.
+            allow(action="iam:ListUsers", resource="*"),
         )
         with User(self.iam, permissions=user_permission) as user:
             iam = user.client("iam")
             user_name = unique_name()
+            denied_name = unique_name()
 
-            def missing_tags():
-                log.info(
-                    "Attempting to create user %s without required tags", user_name
-                )
-                iam.create_user(UserName=user_name, Path=TEST_PATH)
-                log.info("Created user %s without required tags", user_name)
+            # A newly attached inline policy takes time to propagate, and until
+            # it does every call is denied for want of any policy at all.
+            # iam:ListUsers is granted unconditionally in the same document, so
+            # its succeeding rules out that state.
+            eventually(lambda: iam.list_users(MaxItems=1))
 
-            eventually_client_error("AccessDenied", missing_tags)
-
+            # The allowed case runs first, and is retried until the grant is in
+            # effect. Only then does a denial mean the condition failed rather
+            # than the grant not having arrived: the probe above shows the
+            # document is live, but not that this statement's condition is
+            # being applied yet.
             def with_tags():
                 log.info("Attempting to create user %s with required tags", user_name)
                 iam.create_user(
@@ -134,3 +154,14 @@ class TestUserAuthorization(IamTestCase):
             # Clean up the created user
             log.info("Deleting user %s", user_name)
             eventually(lambda: iam.delete_user(UserName=user_name))
+
+            # A distinct name, so that the deletion above needing to propagate
+            # cannot turn this into EntityAlreadyExists.
+            def missing_tags():
+                log.info(
+                    "Attempting to create user %s without required tags", denied_name
+                )
+                iam.create_user(UserName=denied_name, Path=TEST_PATH)
+                log.info("Created user %s without required tags", denied_name)
+
+            eventually_client_error("AccessDenied", missing_tags)
