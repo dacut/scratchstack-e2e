@@ -7,12 +7,22 @@ before it can authorize the call: the tags on the entity back aws:ResourceTag/{}
 and iam:ResourceTag/{}, and the managed policy serving as its permissions
 boundary backs iam:PermissionsBoundary.
 
-    DeleteRole
-    DeleteRolePolicy
-    DeleteUserPermissionsBoundary
-    DeleteUserPolicy
+    DeleteRole                     tags + boundary
+    DeleteRolePolicy               tags + boundary
+    DeleteUserPermissionsBoundary  tags + boundary
+    DeleteUserPolicy               tags + boundary
+    CreateAccessKey                tags only
+    UpdateAccessKey                tags only
+    DeleteAccessKey                tags only
 
-All three keys are asserted for each. The stakes are not symmetric: a *missing*
+The access key operations act on a user and read its tags, but IAM defines no
+iam:PermissionsBoundary for them, so only the two resource-tag spellings are
+asserted there. There is no DeactivateAccessKey API to test: the only
+Deactivate* operation IAM has is DeactivateMFADevice, and deactivating a key is
+UpdateAccessKey with Status=Inactive, which is what test_update_access_key
+does.
+
+Every key an operation is said to supply is asserted for it. The stakes are not symmetric: a *missing*
 key leaves a guard dormant that should have fired, while a *spurious* one makes
 a StringNotEquals deny guard fire where IAM leaves it dormant, changing the
 meaning of a policy an operator already wrote. Scratchstack supplies all three
@@ -154,7 +164,7 @@ class TestExistingEntityConditions(IamTestCase):
             )
         return role
 
-    def target_user(self, tag_value, boundary_arn, *, with_inline_policy=False):
+    def target_user(self, tag_value, boundary_arn=None, *, with_inline_policy=False):
         """
         A user carrying the given tag value and permissions boundary, created
         and torn down as the admin principal.
@@ -176,34 +186,47 @@ class TestExistingEntityConditions(IamTestCase):
             )
         return user
 
-    def assert_keys_govern(self, action, boundary_arn, named, other, invoke):
+    def tag_checks(self, entities):
         """
-        Assert that `action` supplies all three entity-derived condition keys.
+        The two resource-tag spellings, one entity apiece.
 
-        `named` is the three entities the grant reaches, one per key, each
-        through a statement scoped to its own ARN and conditioned on that key
-        alone; `other` is the entity a statement names with a value it does not
-        carry. `invoke` performs the operation against one entity as the
-        subject.
+        Both read the same tags, so no entity state can tell them apart; they
+        are told apart by which statement reaches which entity.
         """
-        named_aws, named_iam, named_pb = named
+        return [
+            (f"aws:ResourceTag/{TAG_KEY}", TAG_VALUE, entities[0]),
+            (f"iam:ResourceTag/{TAG_KEY}", TAG_VALUE, entities[1]),
+        ]
 
+    def tag_and_boundary_checks(self, entities, boundary_arn):
+        """
+        The two resource-tag spellings plus iam:PermissionsBoundary.
+        """
+        return self.tag_checks(entities) + [
+            ("iam:PermissionsBoundary", boundary_arn, entities[2]),
+        ]
+
+    def assert_keys_govern(self, action, checks, other, invoke):
+        """
+        Assert that `action` supplies each condition key in `checks`.
+
+        `checks` pairs each key and the value it should carry with the entity
+        the grant reaches through it, via a statement scoped to that entity's
+        ARN and conditioned on that key alone -- so exactly one statement can
+        account for each allow. `other` is an entity a statement names with a
+        tag value it does not carry; its denial is what shows the conditions
+        are evaluated rather than ignored. `invoke` performs the operation
+        against one entity as the subject.
+        """
         grant = policy(
-            allow(
-                action=action,
-                resource=named_aws.arn,
-                condition={"StringEquals": {f"aws:ResourceTag/{TAG_KEY}": TAG_VALUE}},
-            ),
-            allow(
-                action=action,
-                resource=named_iam.arn,
-                condition={"StringEquals": {f"iam:ResourceTag/{TAG_KEY}": TAG_VALUE}},
-            ),
-            allow(
-                action=action,
-                resource=named_pb.arn,
-                condition={"StringEquals": {"iam:PermissionsBoundary": boundary_arn}},
-            ),
+            *[
+                allow(
+                    action=action,
+                    resource=entity.arn,
+                    condition={"StringEquals": {key: value}},
+                )
+                for key, value, entity in checks
+            ],
             # Named, but with a tag value the entity does not carry. Its being
             # denied is what shows the conditions are evaluated at all.
             allow(
@@ -219,11 +242,7 @@ class TestExistingEntityConditions(IamTestCase):
             iam = subject.client("iam")
             eventually(lambda: iam.list_users(MaxItems=1))
 
-            for entity, key in (
-                (named_aws, f"aws:ResourceTag/{TAG_KEY}"),
-                (named_iam, f"iam:ResourceTag/{TAG_KEY}"),
-                (named_pb, "iam:PermissionsBoundary"),
-            ):
+            for key, _value, entity in checks:
                 with self.subTest(condition_key=key):
                     log.info("Expecting %s to be allowed by %s", action, key)
                     eventually_not_denied(lambda: invoke(iam, entity))
@@ -255,7 +274,10 @@ class TestExistingEntityConditions(IamTestCase):
             role.forget()
 
         self.assert_keys_govern(
-            "iam:DeleteRole", boundary.arn, named, other, invoke
+            "iam:DeleteRole",
+            self.tag_and_boundary_checks(named, boundary.arn),
+            other,
+            invoke,
         )
 
     def test_delete_role_policy(self):
@@ -280,7 +302,10 @@ class TestExistingEntityConditions(IamTestCase):
             )
 
         self.assert_keys_govern(
-            "iam:DeleteRolePolicy", boundary.arn, named, other, invoke
+            "iam:DeleteRolePolicy",
+            self.tag_and_boundary_checks(named, boundary.arn),
+            other,
+            invoke,
         )
 
     def test_delete_user_permissions_boundary(self):
@@ -303,7 +328,10 @@ class TestExistingEntityConditions(IamTestCase):
             iam.delete_user_permissions_boundary(UserName=user.user_name)
 
         self.assert_keys_govern(
-            "iam:DeleteUserPermissionsBoundary", boundary.arn, named, other, invoke
+            "iam:DeleteUserPermissionsBoundary",
+            self.tag_and_boundary_checks(named, boundary.arn),
+            other,
+            invoke,
         )
 
     def test_delete_user_policy(self):
@@ -328,5 +356,86 @@ class TestExistingEntityConditions(IamTestCase):
             )
 
         self.assert_keys_govern(
-            "iam:DeleteUserPolicy", boundary.arn, named, other, invoke
+            "iam:DeleteUserPolicy",
+            self.tag_and_boundary_checks(named, boundary.arn),
+            other,
+            invoke,
+        )
+
+    # ------------------------------------------------------------------
+    # Access keys
+    #
+    # These act on an access key but are authorized against the user that owns
+    # it, so the condition keys describe the user. IAM defines no
+    # iam:PermissionsBoundary for them, so the targets carry tags alone and
+    # only the two resource-tag spellings are asserted.
+    # ------------------------------------------------------------------
+
+    def access_key_targets(self):
+        """
+        Two users the grant reaches, one per resource-tag spelling, and one it
+        does not. Each carries an access key of its own, created by the
+        fixture.
+        """
+        named = [self.target_user(TAG_VALUE) for _ in range(2)]
+        other = self.target_user(OTHER_TAG_VALUE)
+        return named, other
+
+    def test_create_access_key(self):
+        """
+        Test that CreateAccessKey supplies both resource-tag spellings from the
+        user the key is being created for.
+        """
+        named, other = self.access_key_targets()
+
+        def invoke(iam, user):
+            log.info("Attempting to create an access key for user %s", user.user_name)
+            iam.create_access_key(UserName=user.user_name)
+
+        self.assert_keys_govern(
+            "iam:CreateAccessKey", self.tag_checks(named), other, invoke
+        )
+
+    def test_update_access_key(self):
+        """
+        Test that UpdateAccessKey supplies both resource-tag spellings from the
+        user owning the key.
+
+        This is also the deactivation case: IAM has no DeactivateAccessKey, and
+        a key is deactivated by updating its status to Inactive.
+        """
+        named, other = self.access_key_targets()
+
+        def invoke(iam, user):
+            log.info("Attempting to deactivate the access key of user %s", user.user_name)
+            iam.update_access_key(
+                UserName=user.user_name,
+                AccessKeyId=user.credentials["AccessKeyId"],
+                Status="Inactive",
+            )
+
+        self.assert_keys_govern(
+            "iam:UpdateAccessKey", self.tag_checks(named), other, invoke
+        )
+
+    def test_delete_access_key(self):
+        """
+        Test that DeleteAccessKey supplies both resource-tag spellings from the
+        user owning the key.
+
+        The key goes away but the user does not, so no ownership handoff is
+        needed: the fixture finds no keys left to remove and deletes the user
+        as usual.
+        """
+        named, other = self.access_key_targets()
+
+        def invoke(iam, user):
+            log.info("Attempting to delete the access key of user %s", user.user_name)
+            iam.delete_access_key(
+                UserName=user.user_name,
+                AccessKeyId=user.credentials["AccessKeyId"],
+            )
+
+        self.assert_keys_govern(
+            "iam:DeleteAccessKey", self.tag_checks(named), other, invoke
         )
