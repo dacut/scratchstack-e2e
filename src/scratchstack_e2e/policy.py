@@ -24,6 +24,10 @@ class Policy:
     A managed policy that is deleted when the context manager exits.
 
     The ARN is available as `.arn` once entered.
+
+    `tags` are applied by the creating call rather than by a TagPolicy
+    afterwards, so a test conditioned on the policy's tags has nothing extra to
+    wait out: the policy is never visible untagged.
     """
 
     def __init__(
@@ -34,6 +38,7 @@ class Policy:
         policy_name: Optional[str] = None,
         path: str = TEST_PATH,
         description: Optional[str] = None,
+        tags: Optional[Dict[str, str]] = None,
     ):
         if policy_name is None:
             policy_name = unique_name()
@@ -43,6 +48,7 @@ class Policy:
         self.iam = iam
         self.path = path
         self.policy_name = policy_name
+        self.tags = tags
 
     def delete(self):
         arn = self.arn
@@ -103,6 +109,8 @@ class Policy:
         kw = {}
         if self.description is not None:
             kw["Description"] = self.description
+        if self.tags:
+            kw["Tags"] = [{"Key": k, "Value": v} for k, v in self.tags.items()]
 
         log.info("Creating policy %s", self.policy_name)
         response = eventually(

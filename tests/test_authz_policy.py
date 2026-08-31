@@ -15,6 +15,15 @@ names and deny one carrying a different value. An absent key could not produce
 that split, since StringEquals on a key that is not in the request context
 never matches.
 
+CreatePolicyVersion is the open question this file also probes. Its tags come
+from the policy being versioned rather than from the request, and the IAM
+documentation lists only aws:ResourceTag/{} for it. Whether it also carries
+iam:ResourceTag/{}, as CreatePolicy turns out to despite its documentation, is
+not yet settled -- test_iam_resource_tag_governs_create_version is written as
+the hypothesis that it does, so running it against real IAM answers the
+question either way. Scratchstack currently supplies both; nothing there should
+change until that test has been run against AWS.
+
 Ordering matters in these tests. A denial means the condition failed only once
 the grant carrying it is live, and a freshly attached inline policy takes time
 to propagate: IAM passes through states that deny everything, and briefly one
@@ -27,7 +36,7 @@ only be the condition talking.
 from json import dumps
 from logging import getLogger
 
-from scratchstack_e2e import TEST_PATH, IamTestCase, User, unique_name
+from scratchstack_e2e import TEST_PATH, IamTestCase, Policy, User, unique_name
 from scratchstack_e2e.aspen import allow, policy
 from scratchstack_e2e.retry import eventually, eventually_client_error
 
@@ -37,9 +46,17 @@ log = getLogger(__name__)
 #: these tests -- only that it is a valid policy document.
 POLICY_DOCUMENT = policy(allow(action="s3:GetObject", resource="*"))
 
+#: The document a new policy version carries. It differs from POLICY_DOCUMENT
+#: only so that the version added is distinguishable from the original.
+SECOND_POLICY_DOCUMENT = policy(allow(action="s3:PutObject", resource="*"))
+
 #: The tag the grants below are conditioned on.
 TAG_KEY = "TestTag1"
 TAG_VALUE = "TestValue1"
+
+#: A value the grants are never conditioned on, for the resource that must be
+#: refused.
+OTHER_TAG_VALUE = "SomeOtherValue"
 
 
 class TestPolicyAuthorization(IamTestCase):
@@ -198,3 +215,147 @@ class TestPolicyAuthorization(IamTestCase):
                 self.create_policy(iam)
 
             eventually_client_error("AccessDenied", missing_tags)
+
+    # ------------------------------------------------------------------
+    # CreatePolicyVersion
+    #
+    # Unlike CreatePolicy, the tags here belong to the policy being versioned
+    # rather than to the request, so the resource-tag keys are the only ones
+    # that could carry them. Each test uses two policies differing only in the
+    # value of that tag: the grant must reach the one it names and not the
+    # other.
+    # ------------------------------------------------------------------
+
+    def tagged_policy(self, tag_value):
+        """
+        A managed policy carrying TAG_KEY=tag_value, created as the admin
+        principal and torn down with the test.
+
+        The tag is applied by the creating call, so the policy is never visible
+        untagged. The fixture's teardown deletes any non-default versions a
+        test added before deleting the policy itself.
+        """
+        created = self.fixture(
+            Policy(self.iam, POLICY_DOCUMENT, tags={TAG_KEY: tag_value})
+        )
+        log.info("Created policy %s tagged %s=%s", created.arn, TAG_KEY, tag_value)
+        return created
+
+    def create_policy_version(self, iam, policy_arn):
+        """
+        Add a version to an existing policy, returning its version id.
+
+        The version is deliberately not made the default: a non-default version
+        is what the Policy fixture knows how to clean up, and making it default
+        would say nothing more about authorization.
+        """
+        log.info("Attempting to add a version to policy %s", policy_arn)
+        response = iam.create_policy_version(
+            PolicyArn=policy_arn,
+            PolicyDocument=dumps(SECOND_POLICY_DOCUMENT),
+        )
+        version_id = response["PolicyVersion"]["VersionId"]
+        log.info("Created version %s of policy %s", version_id, policy_arn)
+        return version_id
+
+    def assert_condition_governs_create_version(self, condition_key):
+        """
+        Assert that `condition_key` is present in CreatePolicyVersion's request
+        context and carries the versioned policy's tag value.
+
+        Two policies are created, tagged with different values for the same
+        key, and the caller is granted CreatePolicyVersion only where
+        `condition_key` equals one of them. Versioning the policy the grant
+        names must be allowed -- which also proves the grant has propagated --
+        and versioning the other must then be denied. Were the key absent, both
+        would be denied; were the condition ignored, both would be allowed.
+        """
+        named = self.tagged_policy(TAG_VALUE)
+        other = self.tagged_policy(OTHER_TAG_VALUE)
+
+        grant = policy(
+            allow(
+                action="iam:CreatePolicyVersion",
+                resource="*",
+                condition={"StringEquals": {condition_key: TAG_VALUE}},
+            ),
+            # Granted unconditionally, so that it becoming usable proves the
+            # document is live -- necessary but not sufficient, hence the
+            # allow-before-deny ordering below.
+            allow(action="iam:ListPolicies", resource="*"),
+        )
+
+        with User(self.iam, permissions=grant) as user:
+            iam = user.client("iam")
+            eventually(lambda: iam.list_policies(MaxItems=1))
+
+            # The allow comes first and is retried until the grant is in
+            # effect, so the denial afterwards cannot be a propagation
+            # artifact.
+            eventually(lambda: self.create_policy_version(iam, named.arn))
+
+            def on_the_other_policy():
+                self.create_policy_version(iam, other.arn)
+
+            eventually_client_error("AccessDenied", on_the_other_policy)
+
+    def test_aws_resource_tag_governs_create_version(self):
+        """
+        Test that CreatePolicyVersion supplies aws:ResourceTag/{} from the tags
+        on the policy being versioned.
+
+        This is the one the IAM documentation does list for this operation.
+        """
+        self.assert_condition_governs_create_version(f"aws:ResourceTag/{TAG_KEY}")
+
+    def test_iam_resource_tag_governs_create_version(self):
+        """
+        Test whether CreatePolicyVersion also supplies iam:ResourceTag/{}.
+
+        The IAM documentation lists only aws:ResourceTag/{} for this operation.
+        It also omits the iam: keys for CreatePolicy, which the service supplies
+        regardless -- so the documentation being silent is not evidence of
+        absence, and this test is written as the hypothesis that the same holds
+        here.
+
+        Running it against real IAM settles it. Passing means the key is
+        supplied and Scratchstack, which already supplies it, is correct as it
+        stands. Failing at the allow -- AccessDenied on the policy the grant
+        names -- means the documentation is right for this operation and
+        Scratchstack supplies a key IAM does not, which would make a
+        StringEquals guard match and a StringNotEquals deny guard fire where
+        IAM leaves both dormant.
+        """
+        self.assert_condition_governs_create_version(f"iam:ResourceTag/{TAG_KEY}")
+
+    def test_nonexistent_condition_key_denies_create_version(self):
+        """
+        The negative control for the two tests above.
+
+        A condition key that cannot exist must deny CreatePolicyVersion on a
+        policy carrying the tag the condition names. Without this, a denial in
+        the tests above would not distinguish an absent key from a grant that
+        never propagated, and an allow would not distinguish a key that is
+        present from a condition being ignored.
+        """
+        named = self.tagged_policy(TAG_VALUE)
+
+        grant = policy(
+            allow(
+                action="iam:CreatePolicyVersion",
+                resource="*",
+                condition={
+                    "StringEquals": {f"iam:NoSuchKeyAtAll/{TAG_KEY}": TAG_VALUE}
+                },
+            ),
+            allow(action="iam:ListPolicies", resource="*"),
+        )
+
+        with User(self.iam, permissions=grant) as user:
+            iam = user.client("iam")
+            eventually(lambda: iam.list_policies(MaxItems=1))
+
+            def on_the_named_policy():
+                self.create_policy_version(iam, named.arn)
+
+            eventually_client_error("AccessDenied", on_the_named_policy)
