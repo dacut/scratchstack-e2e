@@ -74,292 +74,21 @@ then. Retrying while denied also absorbs the grant's propagation delay, so the
 denial asserted last cannot be a not-yet-live grant.
 """
 
-import time
-from collections import namedtuple
-from json import dumps
 from logging import getLogger
 
-from botocore.exceptions import ClientError
-
-from scratchstack_e2e import Group, IamTestCase, Policy, Role, User
-from scratchstack_e2e.arn import Arn
-from scratchstack_e2e.aspen import allow, policy, trust_policy
-from scratchstack_e2e.retry import (
-    EVENTUAL_BACKOFF_MULTIPLIER,
-    EVENTUAL_INIT_BACKOFF,
-    EVENTUAL_MAX_BACKOFF,
-    EVENTUAL_TIMEOUT,
-    eventually,
-    eventually_client_error,
-)
+from scratchstack_e2e import Policy
+from scratchstack_e2e.conditions import (INLINE_POLICY_NAME, OTHER_TAG_VALUE,
+                                         SOME_DOCUMENT, TAG_KEY, TAG_VALUE,
+                                         Check, ConditionTestCase)
+from scratchstack_e2e.retry import eventually
 
 log = getLogger(__name__)
 
-#: One condition key asserted about one operation: the statement `condition`
-#: that isolates it, and the `entity` reached only through that statement.
-Check = namedtuple("Check", "label condition entity")
 
-#: The tag the resource-tag conditions are written against.
-TAG_KEY = "TestTag1"
-TAG_VALUE = "TestValue1"
-OTHER_TAG_VALUE = "SomeOtherValue"
-
-#: The name of the inline policy the DeleteRolePolicy/DeleteUserPolicy tests
-#: delete off their targets.
-INLINE_POLICY_NAME = "scratchstack-test-inline"
-
-#: A valid document, for the inline policies and the boundary policies alike.
-#: None of these tests care what any of them says.
-SOME_DOCUMENT = policy(allow(action="s3:GetObject", resource="*"))
-
-#: A second document, for the extra policy version DeletePolicyVersion removes.
-SECOND_DOCUMENT = policy(allow(action="s3:PutObject", resource="*"))
-
-
-def eventually_not_denied(probe, *, timeout=EVENTUAL_TIMEOUT):
-    """
-    Call `probe` until it is not refused by the authorization evaluator.
-
-    Returns once the call succeeds or fails for any reason other than
-    AccessDenied: what is under test is whether authorization passed, and an
-    operation can still fail afterwards on its own terms -- DeleteRole reports
-    DeleteConflict for a role with something attached, by which point the
-    authorization decision has already been made.
-
-    Retrying while denied is also what absorbs the propagation delay on a
-    freshly attached grant, so a denial asserted after this has returned cannot
-    be a grant that had not arrived yet.
-    """
-    deadline = time.monotonic() + timeout
-    interval = EVENTUAL_INIT_BACKOFF
-    while True:
-        try:
-            return probe()
-        except ClientError as e:
-            error = e.response.get("Error")
-            assert isinstance(error, dict)
-            code = error.get("Code")
-            if code != "AccessDenied":
-                log.info("Not denied: the call failed with %s instead", code)
-                return e
-            if time.monotonic() >= deadline:
-                raise
-            log.info("Still AccessDenied; will retry in %s seconds", interval)
-            time.sleep(interval)
-            interval = min(interval * EVENTUAL_BACKOFF_MULTIPLIER, EVENTUAL_MAX_BACKOFF)
-
-
-class TestExistingEntityConditions(IamTestCase):
+class TestExistingEntityConditions(ConditionTestCase):
     """
     Tests for the condition keys operations on an existing entity supply.
     """
-
-    def setUp(self):
-        super().setUp()
-        identity = eventually(self.sts.get_caller_identity)
-        self.identity_arn = Arn.parse(identity["Arn"])
-        self.trust = trust_policy(
-            f"arn:{self.identity_arn.partition}:iam::"
-            f"{self.identity_arn.account_id}:root"
-        )
-
-    def boundary_policy(self):
-        """
-        A managed policy to serve as a permissions boundary on a target.
-        """
-        return self.fixture(Policy(self.iam, SOME_DOCUMENT))
-
-    def target_role(self, tag_value, boundary_arn, *, with_inline_policy=False):
-        """
-        A role carrying the given tag value and permissions boundary, created
-        and torn down as the admin principal.
-        """
-        role = self.fixture(
-            Role(
-                self.iam,
-                self.trust,
-                tags={TAG_KEY: tag_value},
-                permissions_boundary=boundary_arn,
-            )
-        )
-        if with_inline_policy:
-            eventually(
-                lambda: self.iam.put_role_policy(
-                    RoleName=role.role_name,
-                    PolicyName=INLINE_POLICY_NAME,
-                    PolicyDocument=dumps(SOME_DOCUMENT),
-                )
-            )
-        return role
-
-    def target_user(self, tag_value, boundary_arn=None, *, with_inline_policy=False):
-        """
-        A user carrying the given tag value and permissions boundary, created
-        and torn down as the admin principal.
-        """
-        user = self.fixture(
-            User(
-                self.iam,
-                tags={TAG_KEY: tag_value},
-                permissions_boundary=boundary_arn,
-            )
-        )
-        if with_inline_policy:
-            eventually(
-                lambda: self.iam.put_user_policy(
-                    UserName=user.user_name,
-                    PolicyName=INLINE_POLICY_NAME,
-                    PolicyDocument=dumps(SOME_DOCUMENT),
-                )
-            )
-        return user
-
-    @staticmethod
-    def supplied(key, value, entity):
-        """
-        A check that `key` is supplied carrying `value`: the statement matches
-        only if it is, so the operation must be allowed on `entity`.
-        """
-        return Check(f"{key} supplied", {"StringEquals": {key: value}}, entity)
-
-    @staticmethod
-    def absent(key, entity):
-        """
-        A check that `key` is not supplied at all. Null matches only a key that
-        is missing, so the operation must be allowed on `entity`.
-
-        Pair this with `mismatched` on a second entity. On its own an allow
-        here says the key is absent, but only the denial rules out the
-        condition being ignored altogether.
-        """
-        return Check(f"{key} absent", {"Null": {key: "true"}}, entity)
-
-    @staticmethod
-    def mismatched(key, value, entity):
-        """
-        A statement naming `entity` under a value it does not carry -- or under
-        a key it does not have at all. Either way it cannot match, so the
-        operation must be denied.
-        """
-        return Check(f"{key} does not match", {"StringEquals": {key: value}}, entity)
-
-    def mismatched_tag(self, entity):
-        """
-        The usual denial: an entity named under a tag value it does not carry.
-        """
-        return self.mismatched(f"aws:ResourceTag/{TAG_KEY}", TAG_VALUE, entity)
-
-    def tag_checks(self, entities):
-        """
-        The two resource-tag spellings, one entity apiece.
-
-        Both read the same tags, so no entity state can tell them apart; they
-        are told apart by which statement reaches which entity.
-        """
-        return [
-            self.supplied(f"aws:ResourceTag/{TAG_KEY}", TAG_VALUE, entities[0]),
-            self.supplied(f"iam:ResourceTag/{TAG_KEY}", TAG_VALUE, entities[1]),
-        ]
-
-    def tag_and_boundary_checks(self, entities, boundary_arn):
-        """
-        The two resource-tag spellings plus iam:PermissionsBoundary.
-        """
-        return self.tag_checks(entities) + [
-            self.supplied("iam:PermissionsBoundary", boundary_arn, entities[2]),
-        ]
-
-    def target_policy(self, tag_value, *, with_extra_version=False):
-        """
-        A managed policy carrying the given tag value, created and torn down as
-        the admin principal.
-        """
-        created = self.fixture(
-            Policy(self.iam, SOME_DOCUMENT, tags={TAG_KEY: tag_value})
-        )
-        if with_extra_version:
-            # A non-default version, so DeletePolicyVersion has something to
-            # remove that is not the default one it is forbidden to touch.
-            arn = created.arn
-            if arn is not None:
-                eventually(
-                    lambda: self.iam.create_policy_version(
-                        PolicyArn=arn,
-                        PolicyDocument=dumps(SECOND_DOCUMENT),
-                    )
-                )
-        return created
-
-    def target_group(self, *, with_inline_policy=False):
-        """
-        A group, created and torn down as the admin principal.
-
-        Groups take no tags -- IAM has no group-tagging operation -- so unlike
-        the other targets here they are told apart only by their ARNs.
-        """
-        group = self.fixture(Group(self.iam))
-        if with_inline_policy:
-            eventually(
-                lambda: self.iam.put_group_policy(
-                    GroupName=group.group_name,
-                    PolicyName=INLINE_POLICY_NAME,
-                    PolicyDocument=dumps(SOME_DOCUMENT),
-                )
-            )
-        return group
-
-    def assert_conditions(self, action, allowed, denied, invoke):
-        """
-        Assert what `action` supplies, one condition key at a time.
-
-        Every check contributes a statement scoped to its own entity ARN and
-        conditioned on that key alone, so exactly one statement can account for
-        each outcome. Checks in `allowed` must let the operation through;
-        checks in `denied` must not. `invoke` performs the operation against
-        one entity as the subject.
-
-        Both lists matter. An allow alone cannot tell a key that is present
-        from a condition that is being ignored, and a denial alone cannot tell
-        a key that is absent from a grant that has not propagated -- which is
-        why the allows run first, retried until the grant is live.
-        """
-        checks = list(allowed) + list(denied)
-        grant = policy(
-            *[
-                allow(
-                    action=action,
-                    resource=check.entity.arn,
-                    condition=check.condition,
-                )
-                for check in checks
-            ],
-            # Granted unconditionally as a propagation probe.
-            allow(
-                action=[
-                    "iam:ListGroups",
-                    "iam:ListPolicies",
-                    "iam:ListRoles",
-                    "iam:ListUsers",
-                ],
-                resource="*",
-            ),
-        )
-
-        with User(self.iam, permissions=grant) as subject:
-            iam = subject.client("iam")
-            eventually(lambda: iam.list_users(MaxItems=1))
-
-            for check in allowed:
-                with self.subTest(check=check.label):
-                    log.info("Expecting %s to be allowed: %s", action, check.label)
-                    eventually_not_denied(lambda: invoke(iam, check.entity))
-
-            for check in denied:
-                with self.subTest(check=check.label):
-                    log.info("Expecting %s to be denied: %s", action, check.label)
-                    eventually_client_error(
-                        "AccessDenied", lambda: invoke(iam, check.entity)
-                    )
 
     def test_delete_role(self):
         """
@@ -707,4 +436,151 @@ class TestExistingEntityConditions(IamTestCase):
             ],
             [self.mismatched(tag_key, TAG_VALUE, other)],
             invoke,
+        )
+
+    # ------------------------------------------------------------------
+    # Detaching a managed policy
+    #
+    # iam:PolicyARN names the policy the request is detaching, so unlike every
+    # other key here it comes from the request rather than from the entity.
+    # Each target carries its own attached policy, recorded on the fixture as
+    # `attached_arn` for the detach call to name.
+    # ------------------------------------------------------------------
+
+    def attachable_policy(self):
+        """A managed policy for attaching to, and detaching from, a target."""
+        return self.fixture(Policy(self.iam, SOME_DOCUMENT))
+
+    def attached(self, entity, managed_policy, attacher, **target):
+        """
+        Attach `managed_policy` to `entity` as the admin principal, recording
+        the ARN on the fixture so the detach call can name it.
+        """
+        eventually(
+            lambda: attacher(PolicyArn=managed_policy.arn, **target)
+        )
+        entity.attached_arn = managed_policy.arn
+        return entity
+
+    def attached_group(self, managed_policy):
+        group = self.target_group()
+        return self.attached(
+            group, managed_policy, self.iam.attach_group_policy,
+            GroupName=group.group_name,
+        )
+
+    def attached_role(self, tag_value, boundary_arn, managed_policy):
+        role = self.target_role(tag_value, boundary_arn)
+        return self.attached(
+            role, managed_policy, self.iam.attach_role_policy,
+            RoleName=role.role_name,
+        )
+
+    def attached_user(self, tag_value, boundary_arn, managed_policy):
+        user = self.target_user(tag_value, boundary_arn)
+        return self.attached(
+            user, managed_policy, self.iam.attach_user_policy,
+            UserName=user.user_name,
+        )
+
+    def test_detach_group_policy(self):
+        """
+        Test that DetachGroupPolicy supplies iam:PolicyARN, and that it is
+        compared against the policy the request names.
+
+        A group is neither taggable nor a principal, so the policy being
+        detached is the only thing a condition here can describe. The second
+        group carries a different policy, so a statement conditioned on the
+        first ARN cannot match its request -- which is what shows the key is
+        compared rather than merely present.
+        """
+        wanted = self.attachable_policy()
+        unwanted = self.attachable_policy()
+        named = self.attached_group(wanted)
+        other = self.attached_group(unwanted)
+
+        def invoke(iam, group):
+            log.info(
+                "Attempting to detach %s from group %s",
+                group.attached_arn,
+                group.group_name,
+            )
+            iam.detach_group_policy(
+                GroupName=group.group_name, PolicyArn=group.attached_arn
+            )
+
+        self.assert_conditions(
+            "iam:DetachGroupPolicy",
+            [self.supplied("iam:PolicyARN", wanted.arn, named)],
+            [self.mismatched("iam:PolicyARN", wanted.arn, other)],
+            invoke,
+        )
+
+    def detach_entity_policy_case(self, action, attach_target, detach):
+        """
+        The shared body of the role and user detach tests, which differ only in
+        which entity they act on.
+
+        Four targets carry the policy the grant names, one per key; a fifth
+        carries a different policy, so a statement conditioned on the first ARN
+        cannot match. The usual non-matching-tag target rounds it out.
+        """
+        boundary = self.boundary_policy()
+        other_boundary = self.boundary_policy()
+        wanted = self.attachable_policy()
+        unwanted = self.attachable_policy()
+
+        named = [attach_target(TAG_VALUE, boundary.arn, wanted) for _ in range(4)]
+        arn_other = attach_target(TAG_VALUE, boundary.arn, unwanted)
+        other = attach_target(OTHER_TAG_VALUE, other_boundary.arn, wanted)
+
+        self.assert_conditions(
+            action,
+            self.tag_and_boundary_checks(named, boundary.arn)
+            + [self.supplied("iam:PolicyARN", wanted.arn, named[3])],
+            [
+                self.mismatched("iam:PolicyARN", wanted.arn, arn_other),
+                self.mismatched_tag(other),
+            ],
+            detach,
+        )
+
+    def test_detach_role_policy(self):
+        """
+        Test that DetachRolePolicy supplies both resource-tag spellings,
+        iam:PermissionsBoundary, and iam:PolicyARN.
+        """
+
+        def detach(iam, role):
+            log.info(
+                "Attempting to detach %s from role %s",
+                role.attached_arn,
+                role.role_name,
+            )
+            iam.detach_role_policy(
+                RoleName=role.role_name, PolicyArn=role.attached_arn
+            )
+
+        self.detach_entity_policy_case(
+            "iam:DetachRolePolicy", self.attached_role, detach
+        )
+
+    def test_detach_user_policy(self):
+        """
+        Test that DetachUserPolicy supplies both resource-tag spellings,
+        iam:PermissionsBoundary, and iam:PolicyARN.
+        """
+
+        def detach(iam, user):
+            log.info(
+                "Attempting to detach %s from user %s",
+                user.attached_arn,
+                user.user_name,
+            )
+            iam.detach_user_policy(
+                UserName=user.user_name, PolicyArn=user.attached_arn
+            )
+
+        self.detach_entity_policy_case(
+            "iam:DetachUserPolicy", self.attached_user, detach
         )
