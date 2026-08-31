@@ -24,3 +24,7 @@ lcov.info
 
 # Python environment
 venv/
+.venv/
+
+# Python cache files
+__pycache__/
