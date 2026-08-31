@@ -165,9 +165,9 @@ class User:
         created = eventually(
             lambda: self.iam.create_user(UserName=self.user_name, Path=self.path, **kw)
         )["User"]
-        log.info("Created test user %s", self.user_name)
         self.arn = created["Arn"]
         self.user_id = created["UserId"]
+        log.info("Created test user %s (%s)", self.user_name, self.user_id)
 
         try:
             self.credentials = eventually(

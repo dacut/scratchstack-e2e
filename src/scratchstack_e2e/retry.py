@@ -43,7 +43,12 @@ def eventually(probe, *, timeout=EVENTUAL_TIMEOUT):
             error = e.response.get("Error")
             assert isinstance(error, dict)
             code = error.get("Code")
-            log.info("Error %s encountered, will retry in %s seconds", code, interval)
+            log.info(
+                "Error %s encountered, will retry in %s seconds; probe=%s",
+                code,
+                interval,
+                probe,
+            )
             time.sleep(interval)
             interval = min(interval * EVENTUAL_BACKOFF_MULTIPLIER, EVENTUAL_MAX_BACKOFF)
 
