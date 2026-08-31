@@ -27,9 +27,14 @@ from .aspen import allow, policy, trust_policy
 from .case import IamTestCase
 from .group import Group
 from .policy import Policy
-from .retry import (EVENTUAL_BACKOFF_MULTIPLIER, EVENTUAL_INIT_BACKOFF,
-                    EVENTUAL_MAX_BACKOFF, EVENTUAL_TIMEOUT, eventually,
-                    eventually_client_error)
+from .retry import (
+    EVENTUAL_BACKOFF_MULTIPLIER,
+    EVENTUAL_INIT_BACKOFF,
+    EVENTUAL_MAX_BACKOFF,
+    EVENTUAL_TIMEOUT,
+    eventually,
+    eventually_client_error,
+)
 from .role import Role
 from .user import User
 

@@ -77,9 +77,15 @@ denial asserted last cannot be a not-yet-live grant.
 from logging import getLogger
 
 from scratchstack_e2e import Policy
-from scratchstack_e2e.conditions import (INLINE_POLICY_NAME, OTHER_TAG_VALUE,
-                                         SOME_DOCUMENT, TAG_KEY, TAG_VALUE,
-                                         Check, ConditionTestCase)
+from scratchstack_e2e.conditions import (
+    INLINE_POLICY_NAME,
+    OTHER_TAG_VALUE,
+    SOME_DOCUMENT,
+    TAG_KEY,
+    TAG_VALUE,
+    Check,
+    ConditionTestCase,
+)
 from scratchstack_e2e.retry import eventually
 
 log = getLogger(__name__)

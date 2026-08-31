@@ -37,10 +37,15 @@ from logging import getLogger
 
 from scratchstack_e2e import User
 from scratchstack_e2e.aspen import allow, policy
-from scratchstack_e2e.conditions import (INLINE_POLICY_NAME, OTHER_TAG_VALUE,
-                                         TAG_KEY, TAG_VALUE, Check,
-                                         ConditionTestCase,
-                                         eventually_not_denied)
+from scratchstack_e2e.conditions import (
+    INLINE_POLICY_NAME,
+    OTHER_TAG_VALUE,
+    TAG_KEY,
+    TAG_VALUE,
+    Check,
+    ConditionTestCase,
+    eventually_not_denied,
+)
 from scratchstack_e2e.retry import eventually, eventually_client_error
 
 log = getLogger(__name__)
