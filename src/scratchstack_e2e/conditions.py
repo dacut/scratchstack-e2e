@@ -63,17 +63,29 @@ SECOND_DOCUMENT = policy(allow(action="s3:PutObject", resource="*"))
 #: says nothing about which assertion grew too large, hence the check below.
 INLINE_POLICY_LIMIT = 2048
 
-#: Failures that happen before the evaluator ever runs. Tolerating these in an
-#: allow assertion would let it pass against a service that does not implement
-#: the operation, or against a request too malformed to authorize -- the test
-#: would report that a condition key is supplied without having asked.
+#: Failures that mean the request did not reach the evaluator and never will.
+#: Tolerating these in an allow assertion would let it pass against a service
+#: that does not implement the operation, or against a request too malformed to
+#: authorize -- the test would report that a condition key is supplied without
+#: having asked.
 NEVER_AUTHORIZED_CODES = frozenset(
     (
         "InvalidAction",
-        "InvalidClientTokenId",
         "MalformedInput",
-        "SignatureDoesNotMatch",
         "ValidationError",
+    )
+)
+
+#: Failures that mean the request has not reached the evaluator *yet*. A
+#: newly created access key is not immediately usable on real AWS, and the
+#: credential can flap for a while after it first works, so these are retried
+#: rather than either tolerated or treated as fatal. Getting that wrong in
+#: either direction is costly: tolerating them passes an assertion that never
+#: ran, and failing on them turns ordinary propagation into a broken test.
+NOT_YET_AUTHORIZED_CODES = frozenset(
+    (
+        "InvalidClientTokenId",
+        "SignatureDoesNotMatch",
     )
 )
 
@@ -108,12 +120,12 @@ def eventually_not_denied(probe, *, timeout=EVENTUAL_TIMEOUT):
                     f"keys the operation supplies. For InvalidAction the "
                     f"service does not implement the operation at all."
                 ) from e
-            if code != "AccessDenied":
+            if code not in NOT_YET_AUTHORIZED_CODES and code != "AccessDenied":
                 log.info("Not denied: the call failed with %s instead", code)
                 return e
             if time.monotonic() >= deadline:
                 raise
-            log.info("Still AccessDenied; will retry in %s seconds", interval)
+            log.info("Got %s; will retry in %s seconds", code, interval)
             time.sleep(interval)
             interval = min(interval * EVENTUAL_BACKOFF_MULTIPLIER, EVENTUAL_MAX_BACKOFF)
 
@@ -205,6 +217,18 @@ class ConditionTestCase(IamTestCase):
         condition being ignored altogether.
         """
         return Check(f"{key} absent", {"Null": {key: "true"}}, entity)
+
+    @staticmethod
+    def multivalued(key, value, entity):
+        """
+        A check on a multivalued key such as aws:TagKeys, which the set
+        operators compare against rather than the plain ones. ForAnyValue
+        matches when the request names `value` among its keys, so the
+        operation must be allowed on `entity`.
+        """
+        return Check(
+            f"{key} supplied", {"ForAnyValue:StringEquals": {key: value}}, entity
+        )
 
     @staticmethod
     def mismatched(key, value, entity):
