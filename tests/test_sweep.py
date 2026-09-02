@@ -149,3 +149,123 @@ class TestSweepOrder(TestCase):
             sweep.main()
 
         self.assertEqual(seen, ["/some/path/"] * len(PHASES))
+
+
+class FakeIam:
+    """
+    An IAM client that records what it was asked to do and answers paginated
+    calls from a canned set of pages.
+
+    Only enough of the interface to drive the sweep phases: every unknown
+    attribute becomes a recording no-op, so a phase calling a delete or detach
+    it should not have called still shows up in `calls`.
+    """
+
+    def __init__(self, pages=None):
+        self.pages = pages or {}
+        self.calls = []
+
+    def get_paginator(self, operation):
+        recorder = self
+
+        class Paginator:
+            def paginate(self, **kwargs):
+                recorder.calls.append((f"paginate:{operation}", kwargs))
+                return recorder.pages.get(operation, [{}])
+
+        return Paginator()
+
+    def __getattr__(self, name):
+        def operation(**kwargs):
+            self.calls.append((name, kwargs))
+            return {}
+
+        return operation
+
+    def names(self):
+        """The operation names called, in order."""
+        return [name for name, _ in self.calls]
+
+
+class TestPolicyVersions(TestCase):
+    """
+    Tests that a managed policy is stripped of its extra versions before the
+    sweeper tries to delete it.
+    """
+
+    #: A policy with two non-default versions alongside the default one. IAM
+    #: refuses to delete a policy carrying any version but its default, and
+    #: refuses to delete the default version on its own.
+    POLICY_ARN = "arn:aws:iam::123456789012:policy/scratchstack-e2e/example"
+    PAGES = {
+        "list_policies": [{"Policies": [{"Arn": POLICY_ARN}]}],
+        "list_policy_versions": [
+            {
+                "Versions": [
+                    {"VersionId": "v1", "IsDefaultVersion": False},
+                    {"VersionId": "v2", "IsDefaultVersion": True},
+                    {"VersionId": "v3", "IsDefaultVersion": False},
+                ]
+            }
+        ],
+    }
+
+    def test_non_default_versions_are_deleted_first(self):
+        """
+        Test that every non-default version is deleted before the policy is.
+
+        A policy carrying more than its default version comes back
+        DeleteConflict, which `eventually` retries to exhaustion and which then
+        aborts the whole sweep. The suite creates extra versions, so this is
+        reached by an ordinary interrupted run rather than by a corner case.
+        """
+        iam = FakeIam(self.PAGES)
+        sweep.cleanup_policies(iam, "/scratchstack-e2e/")
+
+        names = iam.names()
+        self.assertIn("delete_policy", names)
+        self.assertIn("delete_policy_version", names)
+        self.assertLess(
+            names.index("delete_policy_version"),
+            names.index("delete_policy"),
+            "versions must be deleted before the policy they belong to",
+        )
+
+    def test_only_non_default_versions_are_deleted(self):
+        """
+        Test that the default version is left alone.
+
+        IAM rejects deleting the default version directly; it goes with the
+        policy. Deleting it here would trade one DeleteConflict for a different
+        error in the same place.
+        """
+        iam = FakeIam(self.PAGES)
+        sweep.cleanup_policies(iam, "/scratchstack-e2e/")
+
+        deleted = [
+            kwargs["VersionId"]
+            for name, kwargs in iam.calls
+            if name == "delete_policy_version"
+        ]
+        self.assertEqual(sorted(deleted), ["v1", "v3"])
+
+        for name, kwargs in iam.calls:
+            if name == "delete_policy_version":
+                self.assertEqual(kwargs["PolicyArn"], self.POLICY_ARN)
+
+    def test_a_policy_with_only_a_default_version_deletes_no_versions(self):
+        """
+        Test that the common case issues no version deletions at all.
+        """
+        iam = FakeIam(
+            {
+                "list_policies": [{"Policies": [{"Arn": self.POLICY_ARN}]}],
+                "list_policy_versions": [
+                    {"Versions": [{"VersionId": "v1", "IsDefaultVersion": True}]}
+                ],
+            }
+        )
+        sweep.cleanup_policies(iam, "/scratchstack-e2e/")
+
+        self.assertNotIn("delete_policy_version", iam.names())
+        self.assertIn("delete_policy", iam.names())

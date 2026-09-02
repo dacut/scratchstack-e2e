@@ -10,7 +10,9 @@ accumulate instead.
 
 An IAM principal cannot be deleted while it still holds inline policies,
 attached policies, access keys, or group memberships, so each principal is
-stripped of those before it is deleted.
+stripped of those before it is deleted. A managed policy is the same: it cannot
+be deleted while anything is still attached to it, nor while it carries any
+version beyond its default one.
 
 Installed as the `scratchstack-e2e-sweep` console script, and runnable in place
 as `python -m scratchstack_e2e.sweep`. Pass --prefix to sweep a path other than
@@ -123,8 +125,34 @@ def cleanup_policies(iam: IAMClient, prefix: str) -> None:
 
     for policy in policies:
         policy_arn = policy["Arn"]
+
+        # A policy carrying anything beyond its default version cannot be
+        # deleted, and the suite does create extra versions.
+        cleanup_policy_versions(iam, policy_arn)
+
         print(f"Deleting policy: {policy_arn}")
         eventually(lambda: iam.delete_policy(PolicyArn=policy_arn))
+
+
+def cleanup_policy_versions(iam: IAMClient, policy_arn: str) -> None:
+    paginator = iam.get_paginator("list_policy_versions")
+    versions = []
+    for page in eventually(lambda: paginator.paginate(PolicyArn=policy_arn)):
+        versions.extend(page.get("Versions", []))
+
+    for version in versions:
+        # The default version goes with the policy itself, and IAM rejects any
+        # attempt to delete it on its own.
+        if version.get("IsDefaultVersion"):
+            continue
+
+        version_id = version["VersionId"]
+        print(f"Deleting version {version_id} of policy {policy_arn}")
+        eventually(
+            lambda: iam.delete_policy_version(
+                PolicyArn=policy_arn, VersionId=version_id
+            )
+        )
 
 
 def cleanup_roles(iam: IAMClient, prefix: str) -> None:
