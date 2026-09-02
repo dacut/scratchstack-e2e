@@ -55,10 +55,16 @@ def main():
         kw["profile_name"] = args.profile
     session = boto3.Session(**kw)
     iam: IAMClient = session.client("iam")
+    # Order is a correctness constraint, not a preference. A managed policy
+    # cannot be deleted while anything is still attached to it, and each
+    # principal detaches its own attachments as it goes, so every principal
+    # sweep has to precede the policy sweep. Users come first among those,
+    # since a group cannot be deleted while it still has members and it is
+    # cleanup_users that removes them.
     cleanup_users(iam, prefix)
     cleanup_roles(iam, prefix)
-    cleanup_policies(iam, prefix)
     cleanup_groups(iam, prefix)
+    cleanup_policies(iam, prefix)
     print("Done")
 
 
