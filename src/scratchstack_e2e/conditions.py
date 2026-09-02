@@ -26,7 +26,7 @@ from .arn import Arn
 from .aspen import allow, policy, trust_policy
 from .case import IamTestCase
 from .group import Group
-from .policy import Policy
+from .managed_policy import Policy
 from .retry import (
     EVENTUAL_BACKOFF_MULTIPLIER,
     EVENTUAL_INIT_BACKOFF,
