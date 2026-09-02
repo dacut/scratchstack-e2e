@@ -61,34 +61,40 @@ log = getLogger(__name__)
 #: Grants whose action is spelled in some case other than the one IAM names the
 #: API with, each paired with a probe for that API and a note on what varies.
 #:
-#: Every entry names a distinct action, so an entry that matches for the wrong
-#: reason cannot be masked by another entry's grant. All are unparameterized
-#: reads: nothing here depends on a resource existing, so a failure is the
-#: matcher and not a missing fixture.
+#: Every entry names a distinct action that no other entry's grant covers, so an
+#: entry failing to match cannot be masked by a neighbour -- which is why the
+#: wildcard is `iam:listuserpol*` rather than something as broad as
+#: `iam:listuser*`, whose reach would overlap ListUsers above.
+#:
+#: All are reads, and any that names an entity names the subject itself, so
+#: nothing here depends on a fixture existing. They are also all operations
+#: Scratchstack implements: an operation it does not serve fails the request
+#: outright with InvalidAction, before authorization is ever reached, which
+#: would say nothing about the matcher.
 MISCASED_GRANTS = [
     (
         "iam:listusers",
-        lambda iam: iam.list_users(MaxItems=1),
+        lambda iam, name: iam.list_users(MaxItems=1),
         "action name lowercased",
     ),
     (
         "iam:LISTGROUPS",
-        lambda iam: iam.list_groups(MaxItems=1),
+        lambda iam, name: iam.list_groups(MaxItems=1),
         "action name uppercased",
     ),
     (
         "IAM:ListRoles",
-        lambda iam: iam.list_roles(MaxItems=1),
+        lambda iam, name: iam.list_roles(MaxItems=1),
         "service prefix uppercased",
     ),
     (
         "iam:listPOLICIES",
-        lambda iam: iam.list_policies(MaxItems=1),
+        lambda iam, name: iam.list_policies(MaxItems=1),
         "case varying within the action name",
     ),
     (
-        "iam:listsaml*",
-        lambda iam: iam.list_saml_providers(),
+        "iam:listuserpol*",
+        lambda iam, name: iam.list_user_policies(UserName=name),
         "lowercased, reached through a wildcard",
     ),
 ]
@@ -96,21 +102,21 @@ MISCASED_GRANTS = [
 #: An action spelled exactly as IAM names it. Granted alongside the miscased
 #: ones so that its succeeding separates "the document has propagated and the
 #: probes work" from "the matcher accepted the spelling".
-CONTROL_ACTION = "iam:ListAccountAliases"
+CONTROL_ACTION = "iam:GetUser"
 
 
-def control_probe(iam):
+def control_probe(iam, name):
     """The probe for CONTROL_ACTION."""
-    return iam.list_account_aliases()
+    return iam.get_user(UserName=name)
 
 
 #: An action no document below ever mentions, in any case. Its being denied is
 #: what rules out a grant that has quietly widened to everything -- without it,
 #: a matcher that ignored the Action element entirely would pass every
 #: assertion in the first test.
-def ungranted_probe(iam):
+def ungranted_probe(iam, name):
     """A probe for an action that is never granted."""
-    return iam.list_open_id_connect_providers()
+    return iam.list_user_tags(UserName=name)
 
 
 class TestActionNameCase(AuthzTestCase):
@@ -136,12 +142,13 @@ class TestActionNameCase(AuthzTestCase):
             )
         )
         iam = subject.client("iam")
+        name = subject.user_name
 
         # The control first: until it passes, every call is denied for want of
         # a policy at all and nothing below would mean anything.
         log.info("Probing the control grant %s", CONTROL_ACTION)
         self.assertAllowed(
-            lambda: control_probe(iam),
+            lambda: control_probe(iam, name),
             f"{CONTROL_ACTION} is spelled exactly as IAM names it and must be allowed; "
             "the inline policy has not taken effect",
         )
@@ -150,7 +157,7 @@ class TestActionNameCase(AuthzTestCase):
             with self.subTest(action=action):
                 log.info("Probing %s (%s)", action, varies)
                 self.assertAllowed(
-                    lambda: probe(iam),
+                    lambda: probe(iam, name),
                     f"the policy grants {action!r} ({varies}), which names the same "
                     "action as the request; action names are matched without regard "
                     "to case",
@@ -160,8 +167,9 @@ class TestActionNameCase(AuthzTestCase):
         # widened to everything would be caught here rather than passing.
         log.info("Probing an action the document never grants")
         self.assertDenied(
-            lambda: ungranted_probe(iam),
-            "no statement grants iam:ListOpenIDConnectProviders in any case",
+            lambda: ungranted_probe(iam, name),
+            "no statement grants iam:ListUserTags in any case, and no wildcard above\n"
+            "reaches it",
         )
 
     def test_not_action_excludes_regardless_of_case(self):
